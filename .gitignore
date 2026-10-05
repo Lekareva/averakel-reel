@@ -1,0 +1,5 @@
+clips/
+*.mp4
+*.jpg
+*.tmp
+__pycache__/
