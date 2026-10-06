@@ -1,0 +1,37 @@
+{
+  "out": "reel_clean.mp4",
+  "order": "plan",
+  "xfade": 0.5,
+  "ambient": 0.0,
+  "stabilize": true,
+  "color": "nature",
+  "strength": 1.0,
+  "fit": "crop",
+  "clips": [
+    {
+      "file": "VID_20261004_124225.mp4",
+      "start": "auto",
+      "dur": 5.0
+    },
+    {
+      "file": "VID_20261004_125603.mp4",
+      "start": 0.2,
+      "dur": 3.0,
+      "speed": 0.5
+    },
+    {
+      "file": "VID_20261004_131105.mp4",
+      "start": "auto",
+      "dur": 5.0,
+      "rotate": 2.5
+    },
+    {
+      "file": "IMG_20261004_143507.jpg",
+      "dur": 3.5
+    }
+  ],
+  "music": {
+    "file": "track.mp3",
+    "start": 0
+  }
+}
