@@ -19,6 +19,7 @@
   - `"rotate": 3.5` — выравнивание горизонта, если кадр завален (на сколько градусов по часовой);
   - `"music": {"file": "track.mp3", "start": 12}` — склейки ровно на доли трека плюс превью с музыкой для проверки (сам трек ставится в Instagram с той же секунды).
 - **levelcheck** — кадры выбранных клипов с сеткой, чтобы увидеть завал горизонта.
+- **spotcheck** — пятна и капли на стекле (съёмка из машины): кадр с найденными пятнами. В плане у клипа `"despot": "auto"` — пятна вычитаются из кадра до стабилизации, детали за пятном сохраняются. Работает для небольших пятен, когда пейзаж за стеклом движется; крупные разводы, блики и отражения салона не убирает.
 - **covers** — 3 кандидата в обложку: кадр 9:16, обрезка 3:4 для сетки профиля и время кадра в мс (для `videoCoverMilliseconds` в Metricool).
 - **stories** — бонус-сторис из клипов, не вошедших в рилс: лучшие 8 секунд каждого, с живым звуком.
 - **voice** — закадровый голос: шумодав, выравнивание громкости, субтитры по фразам (тайминг по паузам в речи).
@@ -26,10 +27,11 @@
 ## Запуск
 
 ```bash
-pip install pillow numpy librosa
+pip install pillow numpy librosa opencv-python-headless
 python3 reel.py sheet ./clips sheet.jpg
 python3 reel.py montage templates/plan_example.json
 python3 reel.py levelcheck plan.json
+python3 reel.py spotcheck plan.json
 python3 reel.py covers reel_clean.mp4 3
 python3 reel.py stories ./clips plan.json 4 8
 python3 reel.py voice reel_clean.mp4 voice.m4a phrases.txt reel_final.mp4 0.08

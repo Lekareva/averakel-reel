@@ -7,6 +7,7 @@
   voice   clean.mp4 voice.m4a phrases.txt out.mp4 [ambient]
                                          — закадровый голос (шумодав + выравнивание громкости) и субтитры по фразам
   levelcheck plan.json [out.jpg]         — кадры выбранных клипов с сеткой: по ним видно завал горизонта → "rotate" в плане
+  spotcheck plan.json|clip [out.jpg]     — пятна/капли на стекле (съёмка из машины): кадр с найденными пятнами → "despot" в плане
   covers  reel.mp4 [n]                   — n кандидатов в обложку (кадр 9:16 + обрезка 3:4 для сетки) + время кадра в мс
   stories <папка> [plan.json] [n] [dur]  — бонус-сторис из клипов, не вошедших в рилс (лучшие отрезки)
 
@@ -26,10 +27,11 @@ plan.json:
     {"file": "VID_4.mp4", "start": "auto", "dur": 5.0},           # автоподбор самого ровного и резкого куска
     {"file": "VID_5.mp4", "start": 2, "dur": 5, "rotate": 3.5},   # выровнять горизонт: кадр завален на 3.5° по часовой
     {"file": "VID_2.mp4", "start": 0, "dur": 4, "speed": 0.5},   # замедление (лучше из 60 fps)
+    {"file": "VID_6.mp4", "start": 0, "dur": 5, "despot": "auto"},  # убрать пятна на стекле (или список [[x,y,r],...] из spotcheck)
     {"file": "IMG_3.jpg", "dur": 3.5}                             # фото = медленный наезд
   ]
 }
-Требуется: ffmpeg с libvidstab, Python 3 + Pillow + numpy; для ритма — librosa. Шрифт: assets/fonts/Unbounded.ttf (OFL).
+Требуется: ffmpeg с libvidstab, Python 3 + Pillow + numpy (+ opencv-python для пятен); для ритма — librosa. Шрифт: assets/fonts/Unbounded.ttf (OFL).
 """
 import json, math, os, re, subprocess, sys, tempfile
 import numpy as np
@@ -210,6 +212,138 @@ def snap_to_beats(clips, xf, beats, maxdur):
     return out
 
 
+# ---------- пятна на стекле ----------
+
+def _gray_frames(path, n=60, w=540, start=None, dur=None):
+    inf = info(path)
+    d = dur or inf["dur"]; s = start or 0.0
+    fps = n / max(d - 0.1, 0.5)
+    h = int(round(inf["h"] * w / inf["w"] / 2) * 2)
+    ss = ["-ss", str(s), "-t", str(d)] if start is not None else []
+    p = subprocess.run(["ffmpeg", "-v", "error", *ss, "-i", path, "-vf", f"fps={fps:.4f},scale={w}:{h},format=gray",
+                        "-f", "rawvideo", "-"], capture_output=True)
+    a = np.frombuffer(p.stdout, np.uint8)
+    return a[: len(a) // (w * h) * w * h].reshape(-1, h, w).astype(np.float32)
+
+
+def detect_spots(path, start=None, dur=None):
+    """Пятна/капли на стекле: неподвижны относительно камеры, пока сцена за стеклом движется.
+    Возвращает список кругов [x, y, r] в долях кадра (0..1) и карту для проверки."""
+    import cv2
+    f = _gray_frames(path, start=start, dur=dur)
+    if len(f) < 10: return [], None, None
+    hp = np.stack([g - cv2.GaussianBlur(g, (0, 0), 12) for g in f])
+    M = np.median(hp, 0)
+    cons = (np.sign(hp) == np.sign(M)).mean(0)
+    tstd = cv2.GaussianBlur(f.std(0), (0, 0), 6)        # меняется ли фон за пятном
+    cand = ((np.abs(M) > 4) & (cons > 0.8)).astype(np.uint8)
+    cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, lab, st, cen = cv2.connectedComponentsWithStats(cand)
+    Hh, Ww = M.shape; out = []
+    YY, XX = np.ogrid[:Hh, :Ww]
+    for k in range(1, n):
+        x, y, w, h, a = st[k]
+        if a < 10 or a > 0.01 * Hh * Ww: continue
+        if x <= 2 or y <= 2 or x + w >= Ww - 2 or y + h >= Hh - 2: continue      # кромки кадра/капот — не трогаем
+        if a / (w * h) < 0.35 or max(w, h) > 3 * min(w, h): continue            # пятно — округлое, не линия
+        if np.median(tstd[lab == k]) < 3: continue                               # фон совсем не меняется → не отличить от сцены
+        m = M[lab == k]; big = np.abs(m) > 0.3 * np.abs(m).max()
+        if max((m[big] > 0).mean(), (m[big] < 0).mean()) < 0.85: continue        # пятно однородно темнее или светлее
+        r = 0.5 * max(w, h) + 4
+        cx, cy = cen[k]
+        dd = np.hypot(XX - cx, YY - cy); ring = (dd > r + 4) & (dd < r + 40)
+        if np.abs(M[lab == k]).max() < 6 * (np.std(M[ring]) + 0.3): continue   # должно выделяться на фоне, а не быть текстурой
+        out.append([round(float(cx) / Ww, 4), round(float(cy) / Hh, 4), round(float(r) / Ww, 4)])
+    return out, M, f[len(f) // 2]
+
+
+def clean_spots(path, spots, start, dur, out):
+    """Убрать пятна на стекле (пыль, капли, разводы небольшого размера).
+    Пятно неподвижно относительно камеры, сцена за ним движется: по многим кадрам оценивается
+    круглый профиль пятна (насколько оно темнее/светлее и какого оттенка) и вычитается из каждого кадра.
+    Детали за пятном сохраняются — это не размытие и не «замазывание»."""
+    import cv2
+    inf = info(path); Wf, Hf = inf["w"], inf["h"]
+    w = 540; h = int(round(Hf * w / Wf / 2) * 2)
+    pre = TONEMAP if inf["hdr"] else ""
+    n = 80; fps = n / max(dur - 0.1, 0.5)
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(start), "-t", str(dur), "-i", path,
+                          "-vf", f"{pre}fps={fps:.4f},scale={w}:{h},format=rgb24", "-f", "rawvideo", "-"], capture_output=True).stdout
+    fr = np.frombuffer(raw, np.uint8)
+    fr = fr[: len(fr) // (w * h * 3) * w * h * 3].reshape(-1, h, w, 3).astype(np.float32)
+    # Для каждого пятна: медиана по времени отклонения от «местного фона» (широкое размытие),
+    # затем азимутальная медиана по кольцам вокруг центра → круглый профиль пятна.
+    # Всё несимметричное (край горы, провода, облака) в профиль не попадает — его не трогаем.
+    A = np.ones((h, w, 3), np.float32); B = np.zeros((h, w, 3), np.float32)
+    YY, XX = np.mgrid[:h, :w]
+    R = np.zeros((h, w), np.uint8)
+    for x, y, r in spots:
+        cx, cy, rp = x * w, y * h, max(4.0, r * w)
+        big = 3 * rp
+        dev = np.median(fr - np.stack([cv2.GaussianBlur(g, (0, 0), big) for g in fr]), 0)   # (h,w,3)
+        rho = np.hypot(XX - cx, YY - cy); rmax = 1.8 * rp
+        bins = np.arange(0, rmax + 1.5, 1.0); prof = np.zeros((len(bins), 3), np.float32)
+        for j, b0 in enumerate(bins):
+            ring = (rho >= b0) & (rho < b0 + 1.5)
+            if ring.any(): prof[j] = np.median(dev[ring], 0)
+        prof -= np.median(prof[int(1.4 * rp):], 0) if len(prof) > int(1.4 * rp) + 2 else 0
+        taper = np.clip((rmax - bins) / (0.4 * rp), 0, 1)[:, None]; prof *= taper
+        idx = np.clip(rho.astype(int), 0, len(bins) - 1); inside = rho < rmax
+        for ch in range(3):
+            B[..., ch][inside] += prof[idx[inside], ch]
+        cv2.circle(R, (int(cx), int(cy)), int(rmax) + 2, 1, -1)
+    A = cv2.resize(A, (Wf, Hf), interpolation=cv2.INTER_CUBIC); B = cv2.resize(B, (Wf, Hf), interpolation=cv2.INTER_CUBIC)
+    ys, xs = np.where(cv2.resize(R, (Wf, Hf)) > 0)
+    pad = 40; y0, y1 = max(0, ys.min() - pad), min(Hf, ys.max() + pad); x0, x1 = max(0, xs.min() - pad), min(Wf, xs.max() + pad)
+    A, B = A[y0:y1, x0:x1], B[y0:y1, x0:x1]
+    dec = subprocess.Popen(["ffmpeg", "-v", "error", "-ss", str(start), "-t", str(dur), "-i", path,
+                            "-vf", f"{pre}format=rgb24", "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
+    fps_src = inf.get("fps") or 30
+    enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{Wf}x{Hf}",
+                            "-r", str(fps_src), "-i", "-", "-ss", str(start), "-t", str(dur), "-i", path,
+                            "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "14",
+                            "-pix_fmt", "yuv420p", "-c:a", "aac", *SDR, out], stdin=subprocess.PIPE)
+    fsz = Wf * Hf * 3
+    while True:
+        buf = dec.stdout.read(fsz)
+        if len(buf) < fsz: break
+        img = np.frombuffer(buf, np.uint8).reshape(Hf, Wf, 3).copy()
+        roi = img[y0:y1, x0:x1].astype(np.float32)
+        img[y0:y1, x0:x1] = np.clip((roi - B) / A, 0, 255).astype(np.uint8)
+        enc.stdin.write(img.tobytes())
+    enc.stdin.close(); enc.wait(); dec.wait()
+    return out
+
+
+def spotcheck(plan_or_clip, out=None):
+    """Карта пятен для глазной проверки: кадр с найденными пятнами (номера) + карта «неподвижного» слоя."""
+    import cv2
+    if plan_or_clip.endswith(".json"):
+        plan = json.load(open(plan_or_clip)); clips = [c for c in plan["clips"] if not info(c["file"])["photo"]]
+    else:
+        clips = [{"file": plan_or_clip}]
+    tiles = []
+    for c in clips:
+        st = c.get("start"); st = None if st in (None, "auto") else float(st)
+        sp, M, mid = detect_spots(c["file"], st, float(c["dur"]) * float(c.get("speed", 1)) if st is not None else None)
+        if M is None: continue
+        img = cv2.cvtColor(mid.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        Hh, Ww = mid.shape
+        for j, (x, y, r) in enumerate(sp):
+            cv2.circle(img, (int(x * Ww), int(y * Hh)), int(r * Ww) + 6, (0, 0, 255), 2)
+            cv2.putText(img, str(j + 1), (int(x * Ww) + int(r * Ww) + 8, int(y * Hh)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        vis = cv2.cvtColor(np.clip(M * 8 + 128, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        t = np.hstack([img, vis])
+        cv2.putText(t, os.path.basename(c["file"])[:24] + f"  spots: {len(sp)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        tiles.append(t)
+        print(f"{os.path.basename(c['file'])}: {len(sp)} пятен {sp}")
+    if not tiles: return
+    wmax = max(t.shape[1] for t in tiles)
+    tiles = [cv2.copyMakeBorder(t, 0, 0, 0, wmax - t.shape[1], cv2.BORDER_CONSTANT) for t in tiles]
+    out = out or "spotcheck.jpg"
+    cv2.imwrite(out, np.vstack(tiles)); print("OK", out)
+
+
 def render_piece(c, i, tmp, plan):
     o = os.path.join(tmp, f"p{i:02d}.mp4"); f = c["file"]; inf = info(f)
     dur = float(c.get("dur", 5)); speed = float(c.get("speed", 1.0))
@@ -229,6 +363,15 @@ def render_piece(c, i, tmp, plan):
         print(f"    авто-отрезок: с {c['start']} с")
     start = float(c.get("start", 0))
     pre = TONEMAP if inf["hdr"] else ""
+    ds = c.get("despot")
+    if ds:                                       # пятна на стекле: чистим исходник ДО стабилизации (они привязаны к камере)
+        sp = detect_spots(f, start, src_dur)[0] if ds == "auto" else ds   # "auto" или [[x,y,r],...] из spotcheck
+        if sp:
+            f = clean_spots(f, sp, start, src_dur, os.path.join(tmp, f"clean{i}.mp4"))
+            start, pre = 0.0, ""
+            print(f"    пятна на стекле: убрано {len(sp)}")
+        else:
+            print("    пятна на стекле: не найдены")
     lev = level_filter(float(c.get("rotate", 0)))
     if lev: print(f"    горизонт: поворот {float(c['rotate']):+.1f}°")
     stab = ""
@@ -463,6 +606,7 @@ if __name__ == "__main__":
     elif cmd == "sheet": sheet(sys.argv[2:-1] or sys.argv[2:], sys.argv[-1] if sys.argv[-1].endswith(".jpg") and len(sys.argv) > 3 else "sheet.jpg")
     elif cmd == "voice": voice(*sys.argv[2:6], float(sys.argv[6]) if len(sys.argv) > 6 else 0.0)
     elif cmd == "levelcheck": levelcheck(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    elif cmd == "spotcheck": spotcheck(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
     elif cmd == "covers": covers(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 3)
     elif cmd == "stories":
         a = sys.argv[3:]; pj = a[0] if a and a[0].endswith(".json") else None; a = a[1:] if pj else a
