@@ -6,6 +6,9 @@
   montage plan.json                      — «чистый» рилс: стабилизация, цвет «природа», длинные куски, мягкие переходы
   voice   clean.mp4 voice.m4a phrases.txt out.mp4 [ambient]
                                          — закадровый голос (шумодав + выравнивание громкости) и субтитры по фразам
+  levelcheck plan.json [out.jpg]         — кадры выбранных клипов с сеткой: по ним видно завал горизонта → "rotate" в плане
+  covers  reel.mp4 [n]                   — n кандидатов в обложку (кадр 9:16 + обрезка 3:4 для сетки) + время кадра в мс
+  stories <папка> [plan.json] [n] [dur]  — бонус-сторис из клипов, не вошедших в рилс (лучшие отрезки)
 
 plan.json:
 {
@@ -17,15 +20,19 @@ plan.json:
   "color": "nature",        # "nature" | "soft" | "none"
   "strength": 1.0,          # сила цвета «nature», 0.5–1.5
   "fit": "crop",            # горизонтальные клипы: "crop" (обрезать до 9:16) | "blur" (размытый фон)
+  "music": {"file": "track.mp3", "start": 0},   # необязательно: склейки на доли трека; start — с какой секунды трека
   "clips": [
     {"file": "VID_1.mp4", "start": 1.0, "dur": 5.0},
+    {"file": "VID_4.mp4", "start": "auto", "dur": 5.0},           # автоподбор самого ровного и резкого куска
+    {"file": "VID_5.mp4", "start": 2, "dur": 5, "rotate": 3.5},   # выровнять горизонт: кадр завален на 3.5° по часовой
     {"file": "VID_2.mp4", "start": 0, "dur": 4, "speed": 0.5},   # замедление (лучше из 60 fps)
     {"file": "IMG_3.jpg", "dur": 3.5}                             # фото = медленный наезд
   ]
 }
-Требуется: ffmpeg с libvidstab, Python 3 + Pillow. Шрифт: assets/fonts/Unbounded.ttf (OFL).
+Требуется: ffmpeg с libvidstab, Python 3 + Pillow + numpy; для ритма — librosa. Шрифт: assets/fonts/Unbounded.ttf (OFL).
 """
-import json, os, re, subprocess, sys, tempfile
+import json, math, os, re, subprocess, sys, tempfile
+import numpy as np
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
@@ -100,6 +107,109 @@ def geom(fit):
 TONEMAP = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
 
 
+
+# ---------- анализ клипа: резкость, тряска, горизонт ----------
+
+def frames_gray(path, fps=5, w=160, start=None, dur=None):
+    inf = info(path)
+    h = int(round(w * inf["h"] / inf["w"] / 2) * 2) if inf["w"] else 284
+    ss = ["-ss", str(start)] if start else []
+    tt = ["-t", str(dur)] if dur else []
+    p = subprocess.run(["ffmpeg", "-v", "error", *ss, *tt, "-i", path, "-vf", f"fps={fps},scale={w}:{h},format=gray",
+                        "-f", "rawvideo", "-"], capture_output=True)
+    a = np.frombuffer(p.stdout, np.uint8); n = a.size // (w * h)
+    return a[: n * w * h].reshape(n, h, w).astype(np.float32)
+
+
+def _shift(a, b):
+    """Глобальный сдвиг кадра b относительно a (фазовая корреляция)."""
+    A = np.fft.fft2(a - a.mean()); B = np.fft.fft2(b - b.mean())
+    R = A * np.conj(B); R /= np.abs(R) + 1e-6
+    r = np.abs(np.fft.ifft2(R)); y, x = np.unravel_index(np.argmax(r), r.shape)
+    h, w = a.shape
+    return (x if x <= w // 2 else x - w), (y if y <= h // 2 else y - h)
+
+
+def analyze(path, fps=5):
+    F = frames_gray(path, fps)
+    if len(F) < 3: return None
+    lap = lambda f: (4 * f[1:-1, 1:-1] - f[:-2, 1:-1] - f[2:, 1:-1] - f[1:-1, :-2] - f[1:-1, 2:]).var()
+    sharp = np.array([lap(f) for f in F])
+    sh = np.array([(0, 0)] + [_shift(F[i - 1], F[i]) for i in range(1, len(F))], float)
+    k = 5; pad = np.pad(sh, ((k // 2, k // 2), (0, 0)), mode="edge")
+    smooth = np.array([pad[i:i + k].mean(0) for i in range(len(sh))])
+    jitter = np.abs(sh - smooth).sum(1)            # тряска = быстрые рывки (плавная панорама не штрафуется)
+    bright = F.mean((1, 2)) / 255
+    return {"fps": fps, "sharp": sharp, "jitter": jitter, "bright": bright}
+
+
+def best_window(a, dur):
+    n = len(a["sharp"]); L = max(1, int(dur * a["fps"]))
+    if n <= L: return 0.0, 0.0
+    z = lambda x: (x - x.mean()) / (x.std() + 1e-6)
+    s = z(np.log1p(a["sharp"])) - 1.5 * z(a["jitter"]) - 3 * np.clip(np.abs(a["bright"] - 0.5) - 0.3, 0, None)
+    c = np.convolve(s, np.ones(L) / L, mode="valid")
+    i = int(np.argmax(c)); return i / a["fps"], float(c[i])
+
+
+def auto_start(path, dur, speed=1.0):
+    a = analyze(path)
+    if a is None: return 0.0
+    st, _ = best_window(a, dur * speed)
+    return round(st, 2)
+
+
+def level_filter(ang):
+    """ang — на сколько градусов завален кадр (+ = по часовой); поворачиваем обратно и чуть увеличиваем, чтобы не было углов."""
+    if not ang: return ""
+    r = math.radians(-ang); k = math.cos(abs(r)) + (H / W) * math.sin(abs(r))
+    return f"rotate={r:.5f}:c=black,scale=iw*{k:.4f}:ih*{k:.4f},crop={W}:{H},"
+
+
+
+# ---------- проверка горизонта ----------
+
+def levelcheck(plan_path, out=None):
+    pl = json.load(open(plan_path)); b = os.path.dirname(os.path.abspath(plan_path))
+    out = out or os.path.join(b, "levelcheck.jpg"); tw, th = 270, 480; tiles = []
+    for i, c in enumerate(pl["clips"]):
+        f = c["file"] if os.path.isabs(c["file"]) else os.path.join(b, c["file"]); inf = info(f)
+        st = 0 if c.get("start") in (None, "auto") else float(c["start"])
+        t = [] if inf["photo"] else ["-ss", str(st + float(c.get("dur", 4)) / 2)]
+        p = subprocess.run(["ffmpeg", "-v", "error", *t, "-i", f, "-frames:v", "1", "-vf",
+                            f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                           capture_output=True)
+        im = Image.frombytes("RGB", (tw, th), p.stdout[: tw * th * 3]); d = ImageDraw.Draw(im)
+        for y in range(0, th, 40): d.line([(0, y), (tw, y)], fill=(255, 255, 0), width=1)
+        for x in range(0, tw, 45): d.line([(x, 0), (x, th)], fill=(0, 255, 255), width=1)
+        d.rectangle((0, 0, 40, 20), fill=(0, 0, 0)); d.text((4, 3), f"#{i+1}", fill=(255, 255, 255))
+        tiles.append(im)
+    cols = 6; S = Image.new("RGB", (cols * tw, ((len(tiles) + cols - 1) // cols) * th), "white")
+    for i, im in enumerate(tiles): S.paste(im, ((i % cols) * tw, (i // cols) * th))
+    S.save(out, quality=88); print("OK", out)
+
+# ---------- ритм трека ----------
+
+def beat_times(music, start=0.0, length=120):
+    import librosa
+    y, sr = librosa.load(music, sr=22050, offset=float(start), duration=length, mono=True)
+    tempo, fr = librosa.beat.beat_track(y=y, sr=sr, units="frames")
+    return np.atleast_1d(librosa.frames_to_time(fr, sr=sr)), float(np.atleast_1d(tempo)[0])
+
+
+def snap_to_beats(clips, xf, beats, maxdur):
+    """Подгоняет длительности кусков так, чтобы склейки (середины переходов) попадали на доли."""
+    out, t = [], 0.0
+    for i, c in enumerate(clips):
+        want = float(c.get("dur", 5))
+        if i == len(clips) - 1: out.append(want); break
+        target = t + want - xf / 2                     # где была бы склейка
+        cand = beats[(beats > t + 2.5) & (beats < t + maxdur[i] - xf / 2)]
+        b = float(cand[np.argmin(np.abs(cand - target))]) if len(cand) else target
+        d = b - t + xf / 2; out.append(round(d, 3)); t = t + d - xf
+    return out
+
+
 def render_piece(c, i, tmp, plan):
     o = os.path.join(tmp, f"p{i:02d}.mp4"); f = c["file"]; inf = info(f)
     dur = float(c.get("dur", 5)); speed = float(c.get("speed", 1.0))
@@ -114,8 +224,13 @@ def render_piece(c, i, tmp, plan):
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-c:a", "aac", *SDR, o])
         return o, dur
     src_dur = dur * speed                       # сколько исходника нужно
+    if c.get("start") == "auto":
+        c["start"] = min(auto_start(f, dur, speed), max(0, inf["dur"] - src_dur - 0.05))
+        print(f"    авто-отрезок: с {c['start']} с")
     start = float(c.get("start", 0))
     pre = TONEMAP if inf["hdr"] else ""
+    lev = level_filter(float(c.get("rotate", 0)))
+    if lev: print(f"    горизонт: поворот {float(c['rotate']):+.1f}°")
     stab = ""
     if plan.get("stabilize", True):
         trf = os.path.join(tmp, f"t{i}.trf")
@@ -123,7 +238,7 @@ def render_piece(c, i, tmp, plan):
              "-vf", f"{pre}vidstabdetect=shakiness=6:accuracy=12:result={trf}", "-f", "null", "-"])
         stab = f"vidstabtransform=input={trf}:smoothing=20:optzoom=1:zoomspeed=0.2:interpol=bicubic,unsharp=5:5:0.6:3:3:0.3,"
     slow = f"setpts={1/speed:.4f}*PTS," if speed != 1.0 else ""
-    vf = f"{pre}{stab}{slow}{geom(plan.get('fit', 'crop'))},fps={FPS},{col},format=yuv420p"
+    vf = f"{pre}{stab}{slow}{geom(plan.get('fit', 'crop'))},{lev}fps={FPS},{col},format=yuv420p"
     amb = float(plan.get("ambient", 0))
     if inf["audio"] and amb > 0:
         atempo = f"atempo={max(speed,0.5)}," if speed != 1.0 else ""
@@ -145,6 +260,17 @@ def montage(plan_path):
     if plan.get("order") == "time":
         clips = sorted(clips, key=lambda c: info(c["file"])["time"])
     xf = float(plan.get("xfade", 0.5)); tmp = tempfile.mkdtemp()
+    mus = plan.get("music")
+    if mus:
+        mf = mus["file"] if os.path.isabs(mus["file"]) else os.path.join(base, mus["file"])
+        beats, tempo = beat_times(mf, mus.get("start", 0))
+        maxd = []
+        for c in clips:
+            inf = info(c["file"]); sp = float(c.get("speed", 1))
+            st = 0 if c.get("start") in (None, "auto") else float(c["start"])
+            maxd.append(20.0 if inf["photo"] else (inf["dur"] - st) / sp)
+        for c, d in zip(clips, snap_to_beats(clips, xf, beats, maxd)): c["dur"] = d
+        print(f"ритм: {tempo:.0f} BPM, склейки подогнаны под доли", flush=True)
     pieces = []
     for i, c in enumerate(clips):
         print(f"[{i+1}/{len(clips)}] {os.path.basename(c['file'])}", flush=True)
@@ -165,6 +291,74 @@ def montage(plan_path):
             vl, al = f"[v{k}]", f"[a{k}]"
         run(["ffmpeg", "-v", "error", "-y", *ins, "-filter_complex", ";".join(fc), "-map", vl, "-map", al, *enc])
     print("OK", out, round(info(out)["dur"], 1), "сек")
+    if mus:   # превью с музыкой — только чтобы проверить ритм; в Instagram трек ставит Ольга
+        prev = out.replace(".mp4", "_preview_music.mp4")
+        run(["ffmpeg", "-v", "error", "-y", "-i", out, "-ss", str(mus.get("start", 0)), "-i", mf,
+             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", prev])
+        print(f"превью с музыкой: {prev}. В Instagram поставить трек с {mus.get('start', 0)} с.")
+
+
+# ---------- обложки ----------
+
+def covers(video, n=3, outdir=None):
+    outdir = outdir or os.path.splitext(video)[0] + "_covers"; os.makedirs(outdir, exist_ok=True)
+    dur = info(video)["dur"]; ts = np.arange(0.5, max(dur - 0.5, 0.6), 0.5)
+    cand = []
+    for t in ts:
+        p = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.2f}", "-i", video, "-frames:v", "1",
+                            "-vf", "scale=270:480", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True)
+        a = np.frombuffer(p.stdout, np.uint8)
+        if a.size < 270 * 480 * 3: continue
+        im = a[:270 * 480 * 3].reshape(480, 270, 3).astype(np.float32)
+        g = im.mean(2)
+        sharp = (4 * g[1:-1, 1:-1] - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:]).var()
+        rg = im[..., 0] - im[..., 1]; yb = (im[..., 0] + im[..., 1]) / 2 - im[..., 2]
+        colorful = math.hypot(rg.std(), yb.std()) + 0.3 * math.hypot(rg.mean(), yb.mean())
+        expo = 1 - abs(g.mean() / 255 - 0.5) * 2
+        cand.append((t, math.log1p(sharp), colorful, expo))
+    if not cand: print("нет кадров"); return
+    A = np.array([c[1:] for c in cand]); Z = (A - A.mean(0)) / (A.std(0) + 1e-6)
+    score = Z[:, 0] + Z[:, 1] + 0.7 * Z[:, 2]
+    picked = []
+    for i in np.argsort(-score):
+        t = cand[i][0]
+        if all(abs(t - p) >= 3 for p in picked): picked.append(t)
+        if len(picked) == n: break
+    for k, t in enumerate(sorted(picked), 1):
+        full = os.path.join(outdir, f"cover_{k}_{int(t*1000)}ms.jpg")
+        run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.2f}", "-i", video, "-frames:v", "1", "-q:v", "2", full])
+        run(["ffmpeg", "-v", "error", "-y", "-i", full, "-vf", f"crop={W}:{int(W*4/3)}", "-q:v", "2",
+             full.replace(".jpg", "_grid3x4.jpg")])
+        print(f"обложка {k}: {t:.1f} с → videoCoverMilliseconds={int(t*1000)}  {full}")
+
+
+# ---------- бонус-сторис ----------
+
+def stories(folder, plan_path=None, n=4, dur=8.0):
+    used = set()
+    if plan_path:
+        pl = json.load(open(plan_path)); b = os.path.dirname(os.path.abspath(plan_path))
+        used = {os.path.abspath(c["file"] if os.path.isabs(c["file"]) else os.path.join(b, c["file"])) for c in pl["clips"]}
+    cands = []
+    for x in sorted(os.listdir(folder)):
+        f = os.path.abspath(os.path.join(folder, x))
+        if f in used: continue
+        try: inf = info(f)
+        except Exception: continue
+        if inf["photo"] or inf["dur"] < 3: continue
+        a = analyze(f)
+        if a is None: continue
+        st, sc = best_window(a, min(dur, inf["dur"] - 0.1))
+        cands.append((sc + 0.02 * min(inf["dur"], 20), f, st, min(dur, inf["dur"] - st - 0.05)))
+    cands.sort(reverse=True)
+    outdir = os.path.join(folder, "stories"); os.makedirs(outdir, exist_ok=True); tmp = tempfile.mkdtemp()
+    plan = {"stabilize": True, "color": "nature", "ambient": 0.6, "fit": "crop"}
+    for k, (_, f, st, d) in enumerate(cands[:int(n)], 1):
+        o, _ = render_piece({"file": f, "start": st, "dur": d}, k, tmp, plan)
+        dst = os.path.join(outdir, f"story_{k:02d}.mp4")
+        run(["ffmpeg", "-v", "error", "-y", "-i", o, "-c:v", "libx264", "-b:v", "6M", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-movflags", "+faststart", *SDR, dst])
+        print(f"сторис {k}: {os.path.basename(f)} с {st:.1f} с, {d:.1f} с → {dst}")
 
 
 # ---------- лист-превью ----------
@@ -268,4 +462,9 @@ if __name__ == "__main__":
     if cmd == "montage": montage(sys.argv[2])
     elif cmd == "sheet": sheet(sys.argv[2:-1] or sys.argv[2:], sys.argv[-1] if sys.argv[-1].endswith(".jpg") and len(sys.argv) > 3 else "sheet.jpg")
     elif cmd == "voice": voice(*sys.argv[2:6], float(sys.argv[6]) if len(sys.argv) > 6 else 0.0)
+    elif cmd == "levelcheck": levelcheck(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    elif cmd == "covers": covers(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 3)
+    elif cmd == "stories":
+        a = sys.argv[3:]; pj = a[0] if a and a[0].endswith(".json") else None; a = a[1:] if pj else a
+        stories(sys.argv[2], pj, int(a[0]) if a else 4, float(a[1]) if len(a) > 1 else 8.0)
     else: print(__doc__)
